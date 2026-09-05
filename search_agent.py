@@ -1,72 +1,162 @@
 """
 LinkedIn "Hiring - Product Manager" Post Finder
 ------------------------------------------------
-Searches Google's indexed LinkedIn posts (not LinkedIn directly - this stays
-fully compliant with LinkedIn's Terms of Service) for organic "we're hiring"
-style posts mentioning Product Manager roles, and appends new results to a
-Google Sheet.
+Reads Google Alerts emails (delivered to a Gmail inbox you control) that
+match "we're hiring / Product Manager" style LinkedIn posts, and appends
+new results to a Google Sheet.
 
-Designed to be run once per hour (e.g. via GitHub Actions cron).
+This replaces an earlier version that called Google's Custom Search JSON
+API directly - that API is closed to new Google Cloud projects as of 2025
+and is being shut down entirely on January 1, 2027, so it isn't usable for
+a brand-new setup. Google Alerts + Gmail has no such restriction and is
+free indefinitely.
+
+Designed to be run every few hours (e.g. via GitHub Actions cron).
 
 Required environment variables:
-    GOOGLE_API_KEY              - Google Cloud API key with Custom Search API enabled
-    GOOGLE_CSE_ID               - Programmable Search Engine ID (cx)
+    GMAIL_ADDRESS               - The Gmail address receiving your Google Alerts
+    GMAIL_APP_PASSWORD          - A 16-character Gmail App Password (not your normal password)
     GOOGLE_SHEET_ID             - The ID of the target Google Sheet (from its URL)
     GOOGLE_SERVICE_ACCOUNT_FILE - Path to the service account JSON credentials file
 """
 
 import os
 import sys
-import time
+import imaplib
+import email
+from email.header import decode_header
+from urllib.parse import urlparse, parse_qs, unquote
 from datetime import datetime, timezone
 
-import requests
 import gspread
+from bs4 import BeautifulSoup
 from google.oauth2.service_account import Credentials
 
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
 
-GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY")
-GOOGLE_CSE_ID = os.environ.get("GOOGLE_CSE_ID")
+GMAIL_ADDRESS = os.environ.get("GMAIL_ADDRESS")
+GMAIL_APP_PASSWORD = os.environ.get("GMAIL_APP_PASSWORD")
 GOOGLE_SHEET_ID = os.environ.get("GOOGLE_SHEET_ID")
 SERVICE_ACCOUNT_FILE = os.environ.get("GOOGLE_SERVICE_ACCOUNT_FILE", "service_account.json")
 
-# Runs every 3 hours (8 runs/day), so up to 12 queries/run keeps total usage
-# at 96/day - just under Google's 100 free queries/day. Add more only if
-# you've enabled billing on the API.
-KEYWORD_QUERIES = [
-    'site:linkedin.com/posts "Product Manager" "we\'re hiring"',
-    'site:linkedin.com/posts "Product Manager" "hiring" "apply"',
-    'site:linkedin.com/posts "Senior Product Manager" "hiring"',
-    'site:linkedin.com/posts "Product Manager" "join our team"',
-    'site:linkedin.com/posts "Product Manager" "excited to announce" hiring',
-    'site:linkedin.com/posts "Group Product Manager" hiring',
-    'site:linkedin.com/posts "Product Manager" "open position"',
-    'site:linkedin.com/posts "Product Manager" "we are looking for"',
-    'site:linkedin.com/posts "Associate Product Manager" hiring',
-    'site:linkedin.com/posts "Product Manager" remote hiring',
-    'site:linkedin.com/posts "Principal Product Manager" hiring',
-    'site:linkedin.com/posts "Product Manager" "apply now"',
-]
+# Only process alert emails sent from Google's alerts system.
+ALERT_SENDER = "googlealerts-noreply@google.com"
 
-SHEET_HEADER = ["Date Found (UTC)", "Search Term", "Post Title", "Post Link", "Snippet"]
+# Only keep links whose destination contains this - filters out Google's own
+# navigation links (manage alerts, unsubscribe, etc.) inside the email.
+TARGET_URL_FRAGMENT = "linkedin.com/posts"
+
+SHEET_HEADER = ["Date Found (UTC)", "Alert Subject", "Post Title", "Post Link", "Email Date"]
+
 
 # ---------------------------------------------------------------------------
-# Google Custom Search
+# Gmail (IMAP)
 # ---------------------------------------------------------------------------
 
-def google_search(query: str, num: int = 10):
-    """Run one query against the Custom Search JSON API and return raw items."""
-    url = "https://www.googleapis.com/customsearch/v1"
-    params = {"key": GOOGLE_API_KEY, "cx": GOOGLE_CSE_ID, "q": query, "num": num}
-    resp = requests.get(url, params=params, timeout=15)
-    if resp.status_code != 200:
-        print(f"  [warn] search failed ({resp.status_code}) for query: {query}")
-        print(f"  [warn] response: {resp.text[:300]}")
-        return []
-    return resp.json().get("items", [])
+def decode_mime_str(raw):
+    if not raw:
+        return ""
+    parts = decode_header(raw)
+    decoded = ""
+    for text, enc in parts:
+        if isinstance(text, bytes):
+            decoded += text.decode(enc or "utf-8", errors="ignore")
+        else:
+            decoded += text
+    return decoded
+
+
+def unwrap_google_link(href: str) -> str:
+    """Google Alerts wraps every link like https://www.google.com/url?...&url=<real>&...
+    Extract and URL-decode the real destination."""
+    try:
+        parsed = urlparse(href)
+        qs = parse_qs(parsed.query)
+        for key in ("url", "q"):
+            if key in qs and qs[key]:
+                return unquote(qs[key][0])
+    except Exception:
+        pass
+    return href
+
+
+def extract_linkedin_links(html: str):
+    """Return a list of (title, link) tuples for every LinkedIn post link found
+    in a Google Alerts email body, picking the longest anchor text per unique link."""
+    soup = BeautifulSoup(html, "html.parser")
+    best_title_for_link = {}
+    for a in soup.find_all("a", href=True):
+        target = unwrap_google_link(a["href"])
+        if TARGET_URL_FRAGMENT not in target:
+            continue
+        clean_link = target.split("?")[0]
+        text = a.get_text(strip=True)
+        if not text:
+            continue
+        if clean_link not in best_title_for_link or len(text) > len(best_title_for_link[clean_link]):
+            best_title_for_link[clean_link] = text
+    return [(title, link) for link, title in best_title_for_link.items()]
+
+
+def fetch_new_alert_emails():
+    """Connect to Gmail, find unread Google Alerts emails, and return their
+    parsed subject/date/html body/uid - without marking them read yet."""
+    results = []
+    imap = imaplib.IMAP4_SSL("imap.gmail.com")
+    imap.login(GMAIL_ADDRESS, GMAIL_APP_PASSWORD)
+    # "All Mail" catches alerts even if a filter archived or labeled them.
+    imap.select('"[Gmail]/All Mail"', readonly=False)
+
+    status, data = imap.search(None, f'(UNSEEN FROM "{ALERT_SENDER}")')
+    if status != "OK":
+        print(f"  [warn] IMAP search failed: {status}")
+        imap.logout()
+        return results
+
+    uids = data[0].split()
+    print(f"Found {len(uids)} unread alert email(s).")
+
+    for uid in uids:
+        status, msg_data = imap.fetch(uid, "(BODY.PEEK[])")  # PEEK = don't mark as read yet
+        if status != "OK" or not msg_data or msg_data[0] is None:
+            continue
+        raw_email = msg_data[0][1]
+        msg = email.message_from_bytes(raw_email)
+        subject = decode_mime_str(msg.get("Subject", ""))
+        date_hdr = msg.get("Date", "")
+
+        html_body = ""
+        if msg.is_multipart():
+            for part in msg.walk():
+                if part.get_content_type() == "text/html":
+                    charset = part.get_content_charset() or "utf-8"
+                    payload = part.get_payload(decode=True)
+                    if payload:
+                        html_body += payload.decode(charset, errors="ignore")
+        else:
+            if msg.get_content_type() == "text/html":
+                charset = msg.get_content_charset() or "utf-8"
+                payload = msg.get_payload(decode=True)
+                if payload:
+                    html_body = payload.decode(charset, errors="ignore")
+
+        results.append({"uid": uid, "subject": subject, "date": date_hdr, "html": html_body})
+
+    imap.logout()
+    return results
+
+
+def mark_emails_seen(uids):
+    if not uids:
+        return
+    imap = imaplib.IMAP4_SSL("imap.gmail.com")
+    imap.login(GMAIL_ADDRESS, GMAIL_APP_PASSWORD)
+    imap.select('"[Gmail]/All Mail"', readonly=False)
+    for uid in uids:
+        imap.store(uid, "+FLAGS", "\\Seen")
+    imap.logout()
 
 
 # ---------------------------------------------------------------------------
@@ -102,7 +192,7 @@ def load_seen_links(existing_rows):
 # ---------------------------------------------------------------------------
 
 def main():
-    missing = [name for name in ["GOOGLE_API_KEY", "GOOGLE_CSE_ID", "GOOGLE_SHEET_ID"]
+    missing = [name for name in ["GMAIL_ADDRESS", "GMAIL_APP_PASSWORD", "GOOGLE_SHEET_ID"]
                if not os.environ.get(name)]
     if missing:
         print(f"Missing required environment variables: {', '.join(missing)}")
@@ -112,33 +202,34 @@ def main():
     existing_rows = ensure_header(sheet)
     seen_links = load_seen_links(existing_rows)
 
+    emails = fetch_new_alert_emails()
+
     new_rows = []
-    for query in KEYWORD_QUERIES:
-        print(f"Searching: {query}")
-        items = google_search(query)
-        for item in items:
-            link = item.get("link", "").strip()
-            if "linkedin.com/posts" not in link:
-                continue  # skip anything that isn't an individual post URL
+    processed_uids = []
+    for msg in emails:
+        found_any = extract_linkedin_links(msg["html"])
+        processed_uids.append(msg["uid"])
+        for title, link in found_any:
             if link in seen_links:
                 continue
-            title = item.get("title", "")
-            snippet = item.get("snippet", "").replace("\n", " ").strip()
             new_rows.append([
                 datetime.now(timezone.utc).isoformat(timespec="seconds"),
-                query,
+                msg["subject"],
                 title,
                 link,
-                snippet,
+                msg["date"],
             ])
             seen_links.add(link)
-        time.sleep(1)  # be polite between calls
 
     if new_rows:
         sheet.append_rows(new_rows)
         print(f"Added {len(new_rows)} new post(s) to the sheet.")
     else:
-        print("No new posts found this run.")
+        print("No new posts found in this run's alert emails.")
+
+    # Only mark emails as read after successfully processing them, so a
+    # crash earlier in the run leaves them to retry next time.
+    mark_emails_seen(processed_uids)
 
 
 if __name__ == "__main__":
