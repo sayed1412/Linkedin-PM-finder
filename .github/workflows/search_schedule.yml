@@ -1,0 +1,32 @@
+name: LinkedIn PM Post Finder (every 3 hours)
+
+on:
+  schedule:
+    - cron: '0 */3 * * *'   # runs at the top of every 3rd hour (00:00, 03:00, 06:00, ...)
+  workflow_dispatch:          # lets you also trigger it manually from GitHub
+
+jobs:
+  run-search:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Write service account credentials to file
+        run: echo '${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}' > service_account.json
+
+      - name: Run search agent
+        env:
+          GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
+          GOOGLE_CSE_ID: ${{ secrets.GOOGLE_CSE_ID }}
+          GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
+          GOOGLE_SERVICE_ACCOUNT_FILE: service_account.json
+        run: python search_agent.py
